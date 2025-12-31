@@ -1,0 +1,244 @@
+<!doctype html>
+<!--
+  This file was made by ChatGPT 5.2 with guidance from Steve Barlow.
+  Date: 2025-12-31
+-->
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Rotating Text-Stream Dodecahedron</title>
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      background: #2b2b2b;
+      overflow: hidden;
+    }
+    canvas { display: block; }
+  </style>
+</head>
+<body>
+<script type="module">
+  import * as THREE from "https://unpkg.com/three@0.160.0/build/three.module.js";
+
+  // ===== Config =====
+  const BG_HEX = 0x2b2b2b;
+  const SPACE_GLYPH = "•";
+  const REPEAT_SEPARATOR = "#";
+  const FACING_THRESHOLD = 0.15;      // higher = stricter "in view"
+  const ROT_X = 0.003;
+  const ROT_Y = 0.006;
+
+  const STREAMS = [
+    "AI owns us",
+    "Steve",
+    "AI lifts minds",
+    "AI watches all",
+    "Barlow",
+    "AI sparks hope",
+    "AI erases jobs",
+    "AI frees time",
+    "AI ends choice",
+    "AI heals lives",
+    "AI writes truth",
+    "AI finds cures"
+  ];
+
+  const FACE_COLORS = [
+    0xff1744, 0xff9100, 0xffea00,
+    0x76ff03, 0x00e676, 0x00e5ff,
+    0x2979ff, 0x651fff, 0xd500f9,
+    0xff4081, 0x18ffff, 0xff6d00
+  ];
+
+  // ===== Scene / Camera / Renderer =====
+  const scene = new THREE.Scene();
+
+  const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.1, 100);
+  camera.position.set(0, 0, 5);
+
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setSize(innerWidth, innerHeight);
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  renderer.setClearColor(BG_HEX, 1);
+  document.body.appendChild(renderer.domElement);
+
+  // Lights
+  scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+  const dir = new THREE.DirectionalLight(0xffffff, 0.8);
+  dir.position.set(3, 4, 5);
+  scene.add(dir);
+
+  // ===== Dodecahedron (12 materials, one per pentagon) =====
+  const baseGeo = new THREE.DodecahedronGeometry(1.25, 0).toNonIndexed();
+
+  // 12 pentagons; each pentagon is triangulated into 3 triangles => 9 vertices per face (non-indexed)
+  baseGeo.clearGroups();
+  for (let i = 0; i < 12; i++) baseGeo.addGroup(i * 9, 9, i);
+
+  const faceMats = FACE_COLORS.map(c => new THREE.MeshStandardMaterial({
+    color: c,
+    roughness: 0.35,
+    metalness: 0.15,
+    flatShading: true
+  }));
+
+  const dodeca = new THREE.Mesh(baseGeo, faceMats);
+  dodeca.rotation.set(0.55, 0.85, 0.0);
+  scene.add(dodeca);
+
+  // ===== Streams (one per face) =====
+  function makeStream(text) {
+    const t = (text && text.length) ? text : " ";
+    return {
+      t,
+      i: Math.floor(Math.random() * t.length), // random start (desync)
+      pendingSep: false,
+      next() {
+        if (this.pendingSep) {
+          this.pendingSep = false;
+          this.i = 0;
+          return REPEAT_SEPARATOR;
+        }
+        const ch = this.t[this.i] ?? " ";
+        this.i++;
+        if (this.i >= this.t.length) this.pendingSep = true;
+        return ch;
+      }
+    };
+  }
+
+  // ===== Label texture helper =====
+  function makeCharTexture(initialChar) {
+    const size = 256;
+    const canvas = document.createElement("canvas");
+    canvas.width = size;
+    canvas.height = size;
+    const ctx = canvas.getContext("2d");
+
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+
+    function draw(ch) {
+      ctx.clearRect(0, 0, size, size);
+
+      const out = (ch === " ") ? SPACE_GLYPH : ch;
+
+      ctx.font = `900 ${Math.floor(size * 0.82)}px system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif`;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillStyle = "rgba(10,12,18,0.95)";
+      ctx.fillText(out, size / 2, size / 2);
+
+      tex.needsUpdate = true;
+    }
+
+    draw(initialChar);
+    return { tex, draw };
+  }
+
+  // ===== Build one label plane per pentagon, and cache local centers/normals =====
+  const labelPlaneSize = 0.55 * 1.5;
+  const labelGeo = new THREE.PlaneGeometry(labelPlaneSize, labelPlaneSize);
+  const zAxis = new THREE.Vector3(0, 0, 1);
+  const labelOffset = 0.03;
+
+  const pos = baseGeo.attributes.position;
+  const v0 = new THREE.Vector3(), v1 = new THREE.Vector3(), v2 = new THREE.Vector3();
+  const center = new THREE.Vector3();
+  const normal = new THREE.Vector3();
+
+  const faces = []; // { centerL, normalL, stream, draw, facing }
+
+  for (let f = 0; f < 12; f++) {
+    const start = f * 9;
+
+    // Local face center = average of the 9 vertices
+    center.set(0, 0, 0);
+    for (let k = 0; k < 9; k++) {
+      center.x += pos.getX(start + k);
+      center.y += pos.getY(start + k);
+      center.z += pos.getZ(start + k);
+    }
+    center.multiplyScalar(1 / 9);
+
+    // Local face normal from first triangle (start+0,1,2)
+    v0.set(pos.getX(start + 0), pos.getY(start + 0), pos.getZ(start + 0));
+    v1.set(pos.getX(start + 1), pos.getY(start + 1), pos.getZ(start + 1));
+    v2.set(pos.getX(start + 2), pos.getY(start + 2), pos.getZ(start + 2));
+    normal.copy(v1).sub(v0).cross(v2.clone().sub(v0)).normalize();
+
+    const stream = makeStream(STREAMS[f]);
+    const texObj = makeCharTexture(stream.next());
+
+    const mat = new THREE.MeshBasicMaterial({
+      map: texObj.tex,
+      transparent: true,
+      depthTest: true,
+      depthWrite: false
+    });
+
+    const label = new THREE.Mesh(labelGeo, mat);
+    label.position.copy(center).addScaledVector(normal, labelOffset);
+    label.quaternion.setFromUnitVectors(zAxis, normal);
+    dodeca.add(label);
+
+    faces.push({
+      centerL: center.clone(),
+      normalL: normal.clone(),
+      stream,
+      draw: texObj.draw,
+      facing: false
+    });
+  }
+
+  // ===== Per-frame view test / stream advance =====
+  const tmpCenterW = new THREE.Vector3();
+  const tmpNormalW = new THREE.Vector3();
+  const toCam = new THREE.Vector3();
+  const normalMat = new THREE.Matrix3();
+
+  function updateStreams() {
+    // dodeca.matrixWorld is updated by renderer internally, but we rely on it here too
+    dodeca.updateMatrixWorld(true);
+    normalMat.getNormalMatrix(dodeca.matrixWorld);
+
+    for (let i = 0; i < faces.length; i++) {
+      const face = faces[i];
+
+      tmpCenterW.copy(face.centerL).applyMatrix4(dodeca.matrixWorld);
+      tmpNormalW.copy(face.normalL).applyMatrix3(normalMat).normalize();
+
+      toCam.subVectors(camera.position, tmpCenterW).normalize();
+      const nowFacing = tmpNormalW.dot(toCam) > FACING_THRESHOLD;
+
+      if (face.facing && !nowFacing) {
+        face.draw(face.stream.next());
+      }
+      face.facing = nowFacing;
+    }
+  }
+
+  // ===== Animation loop =====
+  function animate() {
+    requestAnimationFrame(animate);
+
+    dodeca.rotation.x += ROT_X;
+    dodeca.rotation.y += ROT_Y;
+
+    updateStreams();
+    renderer.render(scene, camera);
+  }
+  animate();
+
+  // ===== Resize =====
+  addEventListener("resize", () => {
+    camera.aspect = innerWidth / innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(innerWidth, innerHeight);
+  });
+</script>
+</body>
+</html>
